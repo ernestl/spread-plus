@@ -487,16 +487,184 @@ const (
 	skipping  = "skipping"
 )
 
-func (r *Runner) run(client *Client, job *Job, verb string, context interface{}, script, debug string, abend *bool) bool {
-	script = strings.TrimSpace(script)
-	server := client.Server()
-	if len(script) == 0 {
+func joinPhasePath(steps ...string) string {
+	var out []string
+	for _, s := range steps {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return strings.Join(out, " → ")
+}
+
+func phaseLevelName(job *Job, level string) string {
+	if job != nil {
+		switch level {
+		case "project":
+			if job.Project != nil && job.Project.Name != "" {
+				return job.Project.Name
+			}
+		case "backend":
+			if job.Backend != nil && job.Backend.Name != "" {
+				return job.Backend.Name
+			}
+		case "suite":
+			if job.Suite != nil && job.Suite.Name != "" {
+				return strings.TrimSuffix(job.Suite.Name, "/")
+			}
+		case "task":
+			if job.Task != nil && job.Task.Name != "" {
+				return job.Task.Name
+			}
+		}
+	}
+	return level
+}
+
+func namedPhaseStep(job *Job, scriptName string) string {
+	if scriptName == "" {
+		return ""
+	}
+	level, stage := scriptName, ""
+	if i := strings.IndexByte(scriptName, '.'); i >= 0 {
+		level, stage = scriptName[:i], scriptName[i+1:]
+	}
+	name := phaseLevelName(job, level)
+	if stage == "" {
+		return name
+	}
+	return name + "-" + stage
+}
+
+func phaseContextPrefix(verb string, job *Job, context interface{}) []string {
+	if job == nil {
+		return nil
+	}
+	p := namedPhaseStep(job, "project.prepare")
+	b := namedPhaseStep(job, "backend.prepare")
+	s := namedPhaseStep(job, "suite.prepare")
+	t := namedPhaseStep(job, "task.prepare")
+	e := namedPhaseStep(job, "task.execute")
+	tr := namedPhaseStep(job, "task.restore")
+	sr := namedPhaseStep(job, "suite.restore")
+	br := namedPhaseStep(job, "backend.restore")
+
+	switch {
+	case job.Project != nil && context == job.Project:
+		if verb == restoring {
+			return []string{p, b, s, t, e, tr, sr, br}
+		}
+		return nil
+	case job.Backend != nil && context == job.Backend:
+		if verb == restoring {
+			return []string{p, b, s, t, e, tr, sr}
+		}
+		return []string{p}
+	case job.Suite != nil && context == job.Suite:
+		switch verb {
+		case restoring:
+			return []string{p, b, s, t, e, tr}
+		case checking:
+			return []string{p, b}
+		default:
+			return []string{p, b}
+		}
+	case context == job || (job.Task != nil && context == job.Task):
+		switch verb {
+		case executing:
+			return []string{p, b, s, t}
+		case restoring:
+			return []string{p, b, s, t, e}
+		case checking:
+			return []string{p, b, s}
+		default:
+			return []string{p, b, s}
+		}
+	}
+	return nil
+}
+
+func phaseContextCurrent(verb string, job *Job, context interface{}) string {
+	if job == nil {
+		return verb
+	}
+	switch {
+	case job.Project != nil && context == job.Project:
+		if verb == restoring {
+			return namedPhaseStep(job, "project.restore")
+		}
+		return namedPhaseStep(job, "project.prepare")
+	case job.Backend != nil && context == job.Backend:
+		if verb == restoring {
+			return namedPhaseStep(job, "backend.restore")
+		}
+		return namedPhaseStep(job, "backend.prepare")
+	case job.Suite != nil && context == job.Suite:
+		switch verb {
+		case restoring:
+			return namedPhaseStep(job, "suite.restore")
+		case checking:
+			return namedPhaseStep(job, "suite.skip")
+		default:
+			return namedPhaseStep(job, "suite.prepare")
+		}
+	case context == job || (job.Task != nil && context == job.Task):
+		switch verb {
+		case executing:
+			return namedPhaseStep(job, "task.execute")
+		case restoring:
+			return namedPhaseStep(job, "task.restore")
+		case checking:
+			return namedPhaseStep(job, "task.skip")
+		default:
+			return namedPhaseStep(job, "task.prepare")
+		}
+	}
+	return verb
+}
+
+func jobPhasePath(verb string, job *Job, context interface{}) string {
+	return joinPhasePath(append(phaseContextPrefix(verb, job, context), phaseContextCurrent(verb, job, context))...)
+}
+
+func jobPhasePathAt(verb string, job *Job, context interface{}, scripts []StageScript, index int) string {
+	stamped := stampPhasePaths(verb, job, context, scripts)
+	if index < 0 || index >= len(stamped) {
+		return jobPhasePath(verb, job, context)
+	}
+	return stamped[index].Path
+}
+
+func appendPhasePaths(prefix string, job *Job, scripts []StageScript) []StageScript {
+	out := make([]StageScript, len(scripts))
+	acc := prefix
+	for i, s := range scripts {
+		step := namedPhaseStep(job, s.Name)
+		if acc == "" {
+			s.Path = step
+		} else {
+			s.Path = acc + " → " + step
+		}
+		acc = s.Path
+		out[i] = s
+	}
+	return out
+}
+
+func stampPhasePaths(verb string, job *Job, context interface{}, scripts []StageScript) []StageScript {
+	return appendPhasePaths(joinPhasePath(phaseContextPrefix(verb, job, context)...), job, scripts)
+}
+
+func (r *Runner) run(client *Client, job *Job, verb string, context interface{}, scripts, debug []StageScript, abend *bool) bool {
+	if len(scripts) == 0 {
 		return true
 	}
+	job.Breakpoint = false
 	start := time.Now()
 	contextStr := job.StringFor(context)
 	client.SetJob(contextStr)
 	defer client.ResetJob()
+	server := client.Server()
 	if verb == executing {
 		r.mu.Lock()
 		r.sequence[job] = r.last + 1
@@ -528,14 +696,28 @@ func (r *Runner) run(client *Client, job *Job, verb string, context interface{},
 	client.SetWarnTimeout(job.WarnTimeoutFor(context))
 	client.SetKillTimeout(job.KillTimeoutFor(context))
 
+	env := job.Environment
+	if env == nil {
+		env = NewEnvironment()
+	} else {
+		env = env.Copy()
+	}
+	env.Set("SPREAD_OPERATION", verb)
+	scripts = stampPhasePaths(verb, job, context, scripts)
+	if len(scripts) > 0 {
+		env.Set("SPREAD_PHASE_PATH", scripts[len(scripts)-1].Path)
+	} else {
+		env.Set("SPREAD_PHASE_PATH", jobPhasePath(verb, job, context))
+	}
+
 	var err error
 	var out []byte
 	if r.options.Live {
-		_, err = client.Live(script, dir, job.Environment)
+		_, err = client.runScripts(scripts, dir, env, liveOutput)
 	} else if r.options.Perf {
-		out, err = client.Perf(script, dir, job.Environment)
+		out, err = client.runScripts(scripts, dir, env, perfOutput)
 	} else {
-		_, err = client.Trace(script, dir, job.Environment)
+		_, err = client.runScripts(scripts, dir, env, traceOutput)
 	}
 	reportItem.addStatus(err == nil)
 
@@ -549,11 +731,22 @@ func (r *Runner) run(client *Client, job *Job, verb string, context interface{},
 		// Use a different time so it has a different id on Travis, but keep
 		// the original start time so the error message shows the task time.
 		start = start.Add(1)
-		printft(start, startTime|endTime|startFold|endFold, "Error %s %s (%s) : %v", verb, contextStr, server.Label(), err)
-		if debug != "" && !r.options.Live {
+		label := "Error"
+		if isBreakpoint(err) {
+			job.Breakpoint = true
+			label = "Breakpoint"
+		}
+		printft(start, startTime|endTime|startFold|endFold, "%s %s %s (%s) : %v", label, verb, contextStr, server.Label(), err)
+		if len(debug) > 0 && !r.options.Live {
 			var output []byte
 			start = time.Now()
-			output, err = client.Trace(debug, dir, job.Environment)
+			denv := env.Copy()
+			denv.Set("SPREAD_OPERATION", "debugging")
+			debug = appendPhasePaths(denv.Get("SPREAD_PHASE_PATH"), job, debug)
+			if len(debug) > 0 {
+				denv.Set("SPREAD_PHASE_PATH", debug[len(debug)-1].Path)
+			}
+			output, err = client.runScripts(debug, dir, denv, traceOutput)
 			if err != nil {
 				printft(start, startTime|endTime|startFold|endFold, "Error debugging %s (%s) : %v", contextStr, server.Label(), err)
 			} else if len(output) > 0 {
@@ -677,7 +870,7 @@ outer:
 		if insideSuite != nil && insideSuite != job.Suite {
 			if false {
 				printf("WARNING: Was inside missing suite %s on last run, so cannot restore it.", insideSuite)
-			} else if !r.run(client, last, restoring, insideSuite, insideSuite.Restore, insideSuite.Debug, &abend) {
+			} else if !r.run(client, last, restoring, insideSuite, stageScriptsOrigin("suite.restore", insideSuite.Restore, insideSuite.RestoreOrigin), stageScriptsOrigin("suite.debug", insideSuite.Debug, insideSuite.DebugOrigin), &abend) {
 				r.add(&stats.SuiteRestoreError, last)
 				r.add(&stats.TaskAbort, job)
 				badProject = true
@@ -690,7 +883,7 @@ outer:
 
 		if !insideProject {
 			insideProject = true
-			if !r.options.Restore && !r.run(client, job, preparing, r.project, r.project.Prepare, r.project.Debug, &abend) {
+			if !r.options.Restore && !r.run(client, job, preparing, r.project, stageScriptsOrigin("project.prepare", r.project.Prepare, r.project.PrepareOrigin), stageScriptsOrigin("project.debug", r.project.Debug, r.project.DebugOrigin), &abend) {
 				r.add(&stats.ProjectPrepareError, job)
 				r.add(&stats.TaskAbort, job)
 				badProject = true
@@ -698,7 +891,7 @@ outer:
 			}
 
 			insideBackend = true
-			if !r.options.Restore && !r.run(client, job, preparing, backend, backend.Prepare, backend.Debug, &abend) {
+			if !r.options.Restore && !r.run(client, job, preparing, backend, stageScriptsOrigin("backend.prepare", backend.Prepare, backend.PrepareOrigin), stageScriptsOrigin("backend.debug", backend.Debug, backend.DebugOrigin), &abend) {
 				r.add(&stats.BackendPrepareError, job)
 				r.add(&stats.TaskAbort, job)
 				badProject = true
@@ -711,7 +904,7 @@ outer:
 
 			// Check if the suite should be skipped
 			for _, skip := range job.Suite.Skip {
-				if r.run(client, job, checking, job.Suite, skip.If, job.Suite.Debug, &abend) {
+				if r.run(client, job, checking, job.Suite, stageScriptsOrigin("suite.skip", skip.If, skip.IfOrigin), stageScriptsOrigin("suite.debug", job.Suite.Debug, job.Suite.DebugOrigin), &abend) {
 					job.SkipReason = skip.Reason
 					r.add(&stats.SuiteSkip, job)
 					r.add(&stats.TaskSkip, job)
@@ -721,7 +914,7 @@ outer:
 				}
 			}
 
-			if !r.options.Restore && !r.run(client, job, preparing, job.Suite, job.Suite.Prepare, job.Suite.Debug, &abend) {
+			if !r.options.Restore && !r.run(client, job, preparing, job.Suite, stageScriptsOrigin("suite.prepare", job.Suite.Prepare, job.Suite.PrepareOrigin), stageScriptsOrigin("suite.debug", job.Suite.Debug, job.Suite.DebugOrigin), &abend) {
 				r.add(&stats.SuitePrepareError, job)
 				r.add(&stats.TaskAbort, job)
 				badSuite[job.Suite] = true
@@ -729,12 +922,12 @@ outer:
 			}
 		}
 
-		debug := job.Debug()
+		debug := job.DebugScripts()
 
 		// Check if the task should be skipped
 		skipRun := false
 		for _, skip := range job.Task.Skip {
-			if r.run(client, job, checking, job, skip.If, debug, &abend) {
+			if r.run(client, job, checking, job, stageScriptsOrigin("task.skip", skip.If, skip.IfOrigin), debug, &abend) {
 				skipRun = true
 				job.SkipReason = skip.Reason
 				r.add(&stats.TaskSkip, job)
@@ -748,16 +941,20 @@ outer:
 				if r.options.Restore {
 					// Do not prepare or execute, and don't repeat.
 					repeat = -1
-				} else if !r.options.Restore && !r.run(client, job, preparing, job, job.Prepare(), debug, &abend) {
+				} else if !r.options.Restore && !r.run(client, job, preparing, job, job.PrepareScripts(), debug, &abend) {
 					r.add(&stats.TaskPrepareError, job)
 					r.add(&stats.TaskAbort, job)
-					debug = ""
+					debug = nil
 					repeat = -1
-				} else if !r.options.Restore && r.run(client, job, executing, job, job.Task.Execute, debug, &abend) {
+				} else if !r.options.Restore && r.run(client, job, executing, job, stageScriptsOrigin("task.execute", job.Task.Execute, job.Task.ExecuteOrigin), debug, &abend) {
 					r.add(&stats.TaskDone, job)
 				} else if !r.options.Restore {
-					r.add(&stats.TaskError, job)
-					debug = ""
+					if job.Breakpoint {
+						r.add(&stats.TaskBreakpoint, job)
+					} else {
+						r.add(&stats.TaskError, job)
+					}
+					debug = nil
 					repeat = -1
 				}
 				if !abend && !r.options.Restore && repeat <= 0 {
@@ -766,7 +963,7 @@ outer:
 						r.tomb.Killf("cannot fetch artifacts of %s: %v", job, err)
 					}
 				}
-				if !abend && !r.run(client, job, restoring, job, job.Restore(), debug, &abend) {
+				if !abend && !r.run(client, job, restoring, job, job.RestoreScripts(), debug, &abend) {
 					r.add(&stats.TaskRestoreError, job)
 					badProject = true
 					repeat = -1
@@ -780,13 +977,13 @@ outer:
 			printf("Cannot copy contents %v", err)
 			r.tomb.Killf("cannot copy contents: %v", err)
 		}
-		if !r.run(client, last, restoring, insideSuite, insideSuite.Restore, insideSuite.Debug, &abend) {
+		if !r.run(client, last, restoring, insideSuite, stageScriptsOrigin("suite.restore", insideSuite.Restore, insideSuite.RestoreOrigin), stageScriptsOrigin("suite.debug", insideSuite.Debug, insideSuite.DebugOrigin), &abend) {
 			r.add(&stats.SuiteRestoreError, last)
 		}
 		insideSuite = nil
 	}
 	if !abend && insideBackend {
-		if !r.run(client, last, restoring, backend, backend.Restore, backend.Debug, &abend) {
+		if !r.run(client, last, restoring, backend, stageScriptsOrigin("backend.restore", backend.Restore, backend.RestoreOrigin), stageScriptsOrigin("backend.debug", backend.Debug, backend.DebugOrigin), &abend) {
 			r.add(&stats.BackendRestoreError, last)
 		}
 		insideBackend = false
@@ -796,7 +993,7 @@ outer:
 			printf("Cannot copy contents %v", err)
 			r.tomb.Killf("cannot copy contents: %v", err)
 		}
-		if !r.run(client, last, restoring, r.project, r.project.Restore, r.project.Debug, &abend) {
+		if !r.run(client, last, restoring, r.project, stageScriptsOrigin("project.restore", r.project.Restore, r.project.RestoreOrigin), stageScriptsOrigin("project.debug", r.project.Debug, r.project.DebugOrigin), &abend) {
 			r.add(&stats.ProjectRestoreError, last)
 		}
 		insideProject = false
@@ -1204,7 +1401,7 @@ func (r *Runner) completeReport() error {
 		}
 
 		// Add results to the report
-		r.report.addTaskResults(len(r.stats.TaskDone), len(r.stats.TaskError), len(r.stats.TaskAbort), len(r.stats.TaskSkip), len(r.stats.TaskPrepareError), len(r.stats.TaskRestoreError))
+		r.report.addTaskResults(len(r.stats.TaskDone), len(r.stats.TaskError), len(r.stats.TaskAbort), len(r.stats.TaskSkip), len(r.stats.TaskPrepareError), len(r.stats.TaskRestoreError), len(r.stats.TaskBreakpoint))
 		r.report.addSuiteResults(len(r.stats.SuitePrepareError), len(r.stats.SuiteRestoreError), len(r.stats.SuiteSkip))
 		r.report.addBackendResults(len(r.stats.BackendPrepareError), len(r.stats.BackendRestoreError))
 		r.report.addProjectResults(len(r.stats.ProjectPrepareError), len(r.stats.ProjectRestoreError))
@@ -1224,6 +1421,7 @@ func (r *Runner) completeReport() error {
 type stats struct {
 	TaskDone            []*Job
 	TaskError           []*Job
+	TaskBreakpoint      []*Job
 	TaskAbort           []*Job
 	TaskSkip            []*Job
 	TaskPrepareError    []*Job
@@ -1240,6 +1438,7 @@ type stats struct {
 func (s *stats) errorCount() int {
 	errors := [][]*Job{
 		s.TaskError,
+		s.TaskBreakpoint,
 		s.TaskPrepareError,
 		s.TaskRestoreError,
 		s.SuitePrepareError,
@@ -1262,6 +1461,7 @@ func (s *stats) log() {
 
 	logNames(printf, "Skipped tasks", s.TaskSkip, taskSkipReason)
 	logNames(printf, "Failed tasks", s.TaskError, taskName)
+	logNames(printf, "Breakpoint tasks", s.TaskBreakpoint, taskName)
 	logNames(printf, "Failed task prepare", s.TaskPrepareError, taskName)
 	logNames(printf, "Failed task restore", s.TaskRestoreError, taskName)
 	logNames(printf, "Skipped suites", s.SuiteSkip, suiteSkipReason)

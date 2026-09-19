@@ -1,0 +1,22 @@
+project: spread
+
+backends:
+    lxd:
+        systems:
+            - ubuntu-22.04
+            - ubuntu-22.04-b:
+                image: ubuntu-22.04
+
+path: /home/test
+
+suites:
+    ok/:
+        summary: Success path has no stack dump
+        prepare-each: |
+            echo suite-ok-each
+    fail/:
+        summary: Failures that should or should not dump stacks
+        prepare-each: |
+            echo suite-fail-each
+
+# vim:ts=4:sw=4:et

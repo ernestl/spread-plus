@@ -1,0 +1,4 @@
+summary: ERROR helper stays quiet (no stack dump)
+
+execute: |
+    ERROR "boom"

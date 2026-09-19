@@ -350,3 +350,73 @@ func (s *projectSuite) TestFilterRunsBeforeEnvEvaluation(c *C) {
 	_, err = project.Jobs(&spread.Options{Filter: filter})
 	c.Assert(err, ErrorMatches, "nothing matches provider filter")
 }
+
+func (s *projectSuite) TestYAMLBodyOrigin(c *C) {
+	data := []byte(`summary: Nested source failure dumps bash frames
+
+execute: |
+    source lib/a.sh
+    a_call snap core
+`)
+	c.Check(spread.YAMLBodyOrigin(data, "execute"), Equals, 4)
+
+	spreadYaml := []byte(`project: mock-prj
+path: /some/path
+backends:
+ google:
+  systems:
+   - system-1
+  prepare: |
+    echo backend-prep
+suites:
+ tests/:
+  summary: mock tests
+  prepare-each: |
+    echo suite-each
+`)
+	c.Check(spread.YAMLBodyOrigin(spreadYaml, "backends", "google", "prepare"), Equals, 8)
+	c.Check(spread.YAMLBodyOrigin(spreadYaml, "suites", "tests/", "prepare-each"), Equals, 13)
+}
+
+func (s *projectSuite) TestLoadScriptOrigins(c *C) {
+	tmpdir := c.MkDir()
+	spreadYaml := []byte(`project: mock-prj
+path: /some/path
+backends:
+ google:
+  systems:
+   - system-1
+  prepare: |
+    echo backend-prep
+suites:
+ tests/:
+  summary: mock tests
+  prepare-each: |
+    echo suite-each
+`)
+	c.Assert(ioutil.WriteFile(filepath.Join(tmpdir, "spread.yaml"), spreadYaml, 0644), IsNil)
+	c.Assert(os.MkdirAll(filepath.Join(tmpdir, "tests", "nested"), 0755), IsNil)
+	taskYaml := []byte(`summary: mock task
+
+execute: |
+    source lib/a.sh
+    a_call snap core
+`)
+	c.Assert(ioutil.WriteFile(filepath.Join(tmpdir, "tests", "nested", "task.yaml"), taskYaml, 0644), IsNil)
+
+	prj, err := spread.Load(tmpdir)
+	c.Assert(err, IsNil)
+	backend := prj.Backends["google"]
+	c.Assert(backend, NotNil)
+	c.Check(backend.PrepareOrigin.File, Equals, "spread.yaml")
+	c.Check(backend.PrepareOrigin.Line, Equals, spread.YAMLBodyOrigin(spreadYaml, "backends", "google", "prepare"))
+	suite := prj.Suites["tests/"]
+	c.Assert(suite, NotNil)
+	c.Check(suite.PrepareEachOrigin.File, Equals, "spread.yaml")
+	c.Check(suite.PrepareEachOrigin.Line, Equals, spread.YAMLBodyOrigin(spreadYaml, "suites", "tests/", "prepare-each"))
+	task := suite.Tasks["nested"]
+	c.Assert(task, NotNil)
+	c.Check(task.ExecuteOrigin.File, Equals, "tests/nested/task.yaml")
+	c.Check(task.ExecuteOrigin.Line, Equals, 4)
+	c.Check(task.ExecuteOrigin.Line, Equals, spread.YAMLBodyOrigin(taskYaml, "execute"))
+}
