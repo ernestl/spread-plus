@@ -47,6 +47,13 @@ type Project struct {
 	KillTimeout Timeout `yaml:"kill-timeout"`
 
 	TasksLimit int `yaml:"tasks-limit"`
+
+	PrepareOrigin     YAMLOrigin `yaml:"-"`
+	RestoreOrigin     YAMLOrigin `yaml:"-"`
+	DebugOrigin       YAMLOrigin `yaml:"-"`
+	PrepareEachOrigin YAMLOrigin `yaml:"-"`
+	RestoreEachOrigin YAMLOrigin `yaml:"-"`
+	DebugEachOrigin   YAMLOrigin `yaml:"-"`
 }
 
 func (p *Project) String() string { return "project" }
@@ -100,6 +107,13 @@ type Backend struct {
 
 	Priority OptionalInt
 	Manual   bool
+
+	PrepareOrigin     YAMLOrigin `yaml:"-"`
+	RestoreOrigin     YAMLOrigin `yaml:"-"`
+	DebugOrigin       YAMLOrigin `yaml:"-"`
+	PrepareEachOrigin YAMLOrigin `yaml:"-"`
+	RestoreEachOrigin YAMLOrigin `yaml:"-"`
+	DebugEachOrigin   YAMLOrigin `yaml:"-"`
 }
 
 func (b *Backend) String() string { return fmt.Sprintf("backend %q", b.Name) }
@@ -346,8 +360,9 @@ func (e *Environment) Replace(oldkey, newkey, value string) {
 }
 
 type Skip struct {
-	Reason string `yaml:"reason"`
-	If     string `yaml:"if"`
+	Reason   string     `yaml:"reason"`
+	If       string     `yaml:"if"`
+	IfOrigin YAMLOrigin `yaml:"-"`
 }
 
 type Suite struct {
@@ -377,6 +392,13 @@ type Suite struct {
 	Priority OptionalInt
 	Manual   bool
 	Skip     []Skip
+
+	PrepareOrigin     YAMLOrigin `yaml:"-"`
+	RestoreOrigin     YAMLOrigin `yaml:"-"`
+	DebugOrigin       YAMLOrigin `yaml:"-"`
+	PrepareEachOrigin YAMLOrigin `yaml:"-"`
+	RestoreEachOrigin YAMLOrigin `yaml:"-"`
+	DebugEachOrigin   YAMLOrigin `yaml:"-"`
 }
 
 func (s *Suite) String() string { return "suite " + s.Name }
@@ -409,6 +431,11 @@ type Task struct {
 	Priority OptionalInt
 	Manual   bool
 	Skip     []Skip
+
+	PrepareOrigin YAMLOrigin `yaml:"-"`
+	RestoreOrigin YAMLOrigin `yaml:"-"`
+	ExecuteOrigin YAMLOrigin `yaml:"-"`
+	DebugOrigin   YAMLOrigin `yaml:"-"`
 }
 
 func (t *Task) String() string { return t.Name }
@@ -427,6 +454,8 @@ type Job struct {
 
 	Priority   int64
 	SkipReason string
+	// Breakpoint is set when the job's execute script called BREAKPOINT.
+	Breakpoint bool `yaml:"-"`
 }
 
 func (job *Job) String() string {
@@ -447,16 +476,59 @@ func (job *Job) StringFor(context interface{}) string {
 	panic(fmt.Errorf("job %s asked to stringify unrelated value: %v", job, context))
 }
 
+// StageScript is one YAML script body: a stage at a cascade level.
+//
+// Levels cascade as project → backend → system → suite → task.
+// Stages are prepare / prepare-each, restore / restore-each, and
+// debug / debug-each; task.execute, suite.skip, and task.skip are also scripts.
+// Name is "{level}.{stage}" (e.g. suite.prepare-each, task.execute).
+type StageScript struct {
+	Name string
+	Body string
+	// Path is the named cascade up to this script (set by the runner).
+	Path string
+	// OriginFile and OriginLine map bash line 1 of Body to the YAML source.
+	OriginFile string
+	OriginLine int
+}
+
+func (job *Job) PrepareScripts() []StageScript {
+	return joinScripts(
+		originStage("project.prepare-each", job.Project.PrepareEach, job.Project.PrepareEachOrigin),
+		originStage("backend.prepare-each", job.Backend.PrepareEach, job.Backend.PrepareEachOrigin),
+		originStage("suite.prepare-each", job.Suite.PrepareEach, job.Suite.PrepareEachOrigin),
+		originStage("task.prepare", job.Task.Prepare, job.Task.PrepareOrigin),
+	)
+}
+
+func (job *Job) RestoreScripts() []StageScript {
+	return joinScripts(
+		originStage("task.restore", job.Task.Restore, job.Task.RestoreOrigin),
+		originStage("suite.restore-each", job.Suite.RestoreEach, job.Suite.RestoreEachOrigin),
+		originStage("backend.restore-each", job.Backend.RestoreEach, job.Backend.RestoreEachOrigin),
+		originStage("project.restore-each", job.Project.RestoreEach, job.Project.RestoreEachOrigin),
+	)
+}
+
+func (job *Job) DebugScripts() []StageScript {
+	return joinScripts(
+		originStage("task.debug", job.Task.Debug, job.Task.DebugOrigin),
+		originStage("suite.debug-each", job.Suite.DebugEach, job.Suite.DebugEachOrigin),
+		originStage("backend.debug-each", job.Backend.DebugEach, job.Backend.DebugEachOrigin),
+		originStage("project.debug-each", job.Project.DebugEach, job.Project.DebugEachOrigin),
+	)
+}
+
 func (job *Job) Prepare() string {
-	return join(job.Project.PrepareEach, job.Backend.PrepareEach, job.Suite.PrepareEach, job.Task.Prepare)
+	return joinFromScripts(job.PrepareScripts())
 }
 
 func (job *Job) Restore() string {
-	return join(job.Task.Restore, job.Suite.RestoreEach, job.Backend.RestoreEach, job.Project.RestoreEach)
+	return joinFromScripts(job.RestoreScripts())
 }
 
 func (job *Job) Debug() string {
-	return join(job.Task.Debug, job.Suite.DebugEach, job.Backend.DebugEach, job.Project.DebugEach)
+	return joinFromScripts(job.DebugScripts())
 }
 
 func (job *Job) WarnTimeoutFor(context interface{}) time.Duration {
@@ -490,17 +562,37 @@ func (job *Job) timeoutFor(which string, context interface{}, touts []Timeout) t
 	return 0
 }
 
-func join(scripts ...string) string {
-	var buf bytes.Buffer
+func joinScripts(scripts ...StageScript) []StageScript {
+	out := make([]StageScript, 0, len(scripts))
 	for _, script := range scripts {
-		if len(script) == 0 {
+		if script.Body == "" {
 			continue
 		}
+		out = append(out, script)
+	}
+	return out
+}
+
+func originStage(name, body string, origin YAMLOrigin) StageScript {
+	return StageScript{Name: name, Body: body, OriginFile: origin.File, OriginLine: origin.Line}
+}
+
+func stageScripts(name, body string) []StageScript {
+	return stageScriptsOrigin(name, body, YAMLOrigin{})
+}
+
+func stageScriptsOrigin(name, body string, origin YAMLOrigin) []StageScript {
+	return joinScripts(originStage(name, body, origin))
+}
+
+func joinFromScripts(scripts []StageScript) string {
+	var buf bytes.Buffer
+	for _, script := range scripts {
 		if buf.Len() > 0 {
 			buf.WriteString("\n\n")
 		}
 		buf.WriteString("(\n")
-		buf.WriteString(script)
+		buf.WriteString(script.Body)
 		buf.WriteString("\n)")
 	}
 	return buf.String()
@@ -556,6 +648,7 @@ func Load(path string) (*Project, error) {
 	}
 
 	project.Path = filepath.Dir(filename)
+	projectFile := yamlRelFile(project.Path, filename)
 
 	project.Repack = strings.TrimSpace(project.Repack)
 	project.Prepare = strings.TrimSpace(project.Prepare)
@@ -564,6 +657,12 @@ func Load(path string) (*Project, error) {
 	project.PrepareEach = strings.TrimSpace(project.PrepareEach)
 	project.RestoreEach = strings.TrimSpace(project.RestoreEach)
 	project.DebugEach = strings.TrimSpace(project.DebugEach)
+	project.PrepareOrigin = locateYAMLOrigin(projectFile, data, project.Prepare, "prepare")
+	project.RestoreOrigin = locateYAMLOrigin(projectFile, data, project.Restore, "restore")
+	project.DebugOrigin = locateYAMLOrigin(projectFile, data, project.Debug, "debug")
+	project.PrepareEachOrigin = locateYAMLOrigin(projectFile, data, project.PrepareEach, "prepare-each")
+	project.RestoreEachOrigin = locateYAMLOrigin(projectFile, data, project.RestoreEach, "restore-each")
+	project.DebugEachOrigin = locateYAMLOrigin(projectFile, data, project.DebugEach, "debug-each")
 
 	if err := checkEnv(project, &project.Environment); err != nil {
 		return nil, err
@@ -606,6 +705,12 @@ func Load(path string) (*Project, error) {
 		backend.PrepareEach = strings.TrimSpace(backend.PrepareEach)
 		backend.RestoreEach = strings.TrimSpace(backend.RestoreEach)
 		backend.DebugEach = strings.TrimSpace(backend.DebugEach)
+		backend.PrepareOrigin = locateYAMLOrigin(projectFile, data, backend.Prepare, "backends", bname, "prepare")
+		backend.RestoreOrigin = locateYAMLOrigin(projectFile, data, backend.Restore, "backends", bname, "restore")
+		backend.DebugOrigin = locateYAMLOrigin(projectFile, data, backend.Debug, "backends", bname, "debug")
+		backend.PrepareEachOrigin = locateYAMLOrigin(projectFile, data, backend.PrepareEach, "backends", bname, "prepare-each")
+		backend.RestoreEachOrigin = locateYAMLOrigin(projectFile, data, backend.RestoreEach, "backends", bname, "restore-each")
+		backend.DebugEachOrigin = locateYAMLOrigin(projectFile, data, backend.DebugEach, "backends", bname, "debug-each")
 
 		// Cascade the backend parameters to the systems
 		for sysname, system := range backend.Systems {
@@ -667,6 +772,7 @@ func Load(path string) (*Project, error) {
 		if !validSuite.MatchString(sname) {
 			return nil, fmt.Errorf("invalid suite name: %q", sname)
 		}
+		suiteKey := sname
 		sname = strings.Trim(sname, "/")
 		suite.Name = sname + "/"
 		suite.Path = filepath.Join(project.Path, sname)
@@ -677,12 +783,19 @@ func Load(path string) (*Project, error) {
 		suite.PrepareEach = strings.TrimSpace(suite.PrepareEach)
 		suite.RestoreEach = strings.TrimSpace(suite.RestoreEach)
 		suite.DebugEach = strings.TrimSpace(suite.DebugEach)
+		suite.PrepareOrigin = locateYAMLOrigin(projectFile, data, suite.Prepare, "suites", suiteKey, "prepare")
+		suite.RestoreOrigin = locateYAMLOrigin(projectFile, data, suite.Restore, "suites", suiteKey, "restore")
+		suite.DebugOrigin = locateYAMLOrigin(projectFile, data, suite.Debug, "suites", suiteKey, "debug")
+		suite.PrepareEachOrigin = locateYAMLOrigin(projectFile, data, suite.PrepareEach, "suites", suiteKey, "prepare-each")
+		suite.RestoreEachOrigin = locateYAMLOrigin(projectFile, data, suite.RestoreEach, "suites", suiteKey, "restore-each")
+		suite.DebugEachOrigin = locateYAMLOrigin(projectFile, data, suite.DebugEach, "suites", suiteKey, "debug-each")
 		for i := range suite.Skip {
 			suite.Skip[i].Reason = strings.TrimSpace(suite.Skip[i].Reason)
 			suite.Skip[i].If = strings.TrimSpace(suite.Skip[i].If)
 			if suite.Skip[i].If == "" || suite.Skip[i].Reason == "" {
 				return nil, fmt.Errorf("%s is missing either the if or reason for the skip", suite)
 			}
+			suite.Skip[i].IfOrigin = locateYAMLOrigin(projectFile, data, suite.Skip[i].If, "suites", suiteKey, "skip", strconv.Itoa(i), "if")
 		}
 
 		project.Suites[suite.Name] = suite
@@ -741,13 +854,20 @@ func Load(path string) (*Project, error) {
 			task.Summary = strings.TrimSpace(task.Summary)
 			task.Prepare = strings.TrimSpace(task.Prepare)
 			task.Restore = strings.TrimSpace(task.Restore)
+			task.Execute = strings.TrimSpace(task.Execute)
 			task.Debug = strings.TrimSpace(task.Debug)
-			for _, skip := range task.Skip {
-				skip.Reason = strings.TrimSpace(skip.Reason)
-				skip.If = strings.TrimSpace(skip.If)
-				if skip.If == "" || skip.Reason == "" {
+			taskFile := yamlRelFile(project.Path, tfilename)
+			task.PrepareOrigin = locateYAMLOrigin(taskFile, tdata, task.Prepare, "prepare")
+			task.RestoreOrigin = locateYAMLOrigin(taskFile, tdata, task.Restore, "restore")
+			task.ExecuteOrigin = locateYAMLOrigin(taskFile, tdata, task.Execute, "execute")
+			task.DebugOrigin = locateYAMLOrigin(taskFile, tdata, task.Debug, "debug")
+			for i := range task.Skip {
+				task.Skip[i].Reason = strings.TrimSpace(task.Skip[i].Reason)
+				task.Skip[i].If = strings.TrimSpace(task.Skip[i].If)
+				if task.Skip[i].If == "" || task.Skip[i].Reason == "" {
 					return nil, fmt.Errorf("%s is missing either the if or reason for the skip", task)
 				}
+				task.Skip[i].IfOrigin = locateYAMLOrigin(taskFile, tdata, task.Skip[i].If, "skip", strconv.Itoa(i), "if")
 			}
 			if !validTask.MatchString(task.Name) {
 				return nil, fmt.Errorf("invalid task name: %q", task.Name)

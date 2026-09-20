@@ -330,9 +330,43 @@ type rebootError struct {
 
 func (e *rebootError) Error() string { return "reboot requested" }
 
+const (
+	errorExitStatus      = 213
+	breakpointExitStatus = 214
+)
+
+type breakpointError struct {
+	msg    string
+	output []byte
+}
+
+func (e *breakpointError) Error() string {
+	msg := e.msg
+	if msg == "" {
+		msg = "breakpoint"
+	}
+	output := bytes.TrimSpace(e.output)
+	if len(output) == 0 {
+		return msg
+	}
+	if bytes.Contains(output, []byte{'\n'}) {
+		return fmt.Sprintf("%s\n-----\n%s\n-----", msg, output)
+	}
+	return fmt.Sprintf("%s: %s", msg, output)
+}
+
+func isBreakpoint(err error) bool {
+	_, ok := err.(*breakpointError)
+	return ok
+}
+
 const maxReboots = 10
 
 func (c *Client) run(script string, dir string, env *Environment, mode outputMode) (output []byte, err error) {
+	return c.runScripts(stageScripts("script", strings.TrimSpace(script)), dir, env, mode)
+}
+
+func (c *Client) runScripts(scripts []StageScript, dir string, env *Environment, mode outputMode) (output []byte, err error) {
 	if env == nil {
 		env = NewEnvironment()
 	}
@@ -342,7 +376,7 @@ func (c *Client) run(script string, dir string, env *Environment, mode outputMod
 			rebootKey = strconv.Itoa(reboot)
 		}
 		env.Set("SPREAD_REBOOT", rebootKey)
-		output, err = c.runPart(script, dir, env, mode, output)
+		output, err = c.runPart(scripts, dir, env, mode, output)
 		rerr, ok := err.(*rebootError)
 		if !ok {
 			return output, err
@@ -419,12 +453,10 @@ var toBashRC = map[string]bool{
 	"SPREAD_SYSTEM":  true,
 }
 
-func (c *Client) runPart(script string, dir string, env *Environment, mode outputMode, previous []byte) (output []byte, err error) {
-	script = strings.TrimSpace(script)
-	if len(script) == 0 && mode != shellOutput {
+func (c *Client) runPart(scripts []StageScript, dir string, env *Environment, mode outputMode, previous []byte) (output []byte, err error) {
+	if len(scripts) == 0 && mode != shellOutput {
 		return nil, nil
 	}
-	script += "\n"
 	session, err := c.sshc.NewSession()
 	if err != nil {
 		return nil, err
@@ -433,6 +465,9 @@ func (c *Client) runPart(script string, dir string, env *Environment, mode outpu
 
 	var buf bytes.Buffer
 	buf.WriteString("set -eu\n")
+	if mode != shellOutput {
+		buf.WriteString("set -E\n")
+	}
 	var rc = func(use bool, s string) string { return s }
 	if mode == shellOutput {
 		buf.WriteString("true > /root/.bashrc\n")
@@ -452,8 +487,9 @@ func (c *Client) runPart(script string, dir string, env *Environment, mode outpu
 		buf.WriteString("unset SUDO_UID\n")
 		buf.WriteString("unset SUDO_GID\n")
 	}
-	buf.WriteString(rc(false, "REBOOT() { { set +xu; } 2> /dev/null; [ -z \"$1\" ] && echo '<REBOOT>' || echo \"<REBOOT $1>\"; exit 213; }\n"))
-	buf.WriteString(rc(false, "ERROR() { { set +xu; } 2> /dev/null; [ -z \"$1\" ] && echo '<ERROR>' || echo \"<ERROR $@>\"; exit 213; }\n"))
+	buf.WriteString(rc(false, "REBOOT() { { set +xu; trap - ERR; } 2> /dev/null; [ -z \"$1\" ] && echo '<REBOOT>' || echo \"<REBOOT $1>\"; exit 213; }\n"))
+	buf.WriteString(rc(false, "ERROR() { { set +xu; trap - ERR; } 2> /dev/null; [ -z \"$1\" ] && echo '<ERROR>' || echo \"<ERROR $@>\"; exit 213; }\n"))
+	buf.WriteString(rc(false, "BREAKPOINT() { local pipestatus=\"${PIPESTATUS[*]}\"; { set +x; } 2>/dev/null; spread_stack_dump 214 \"BREAKPOINT${*:+ $*}\" \"${pipestatus:-214}\"; { trap - ERR; set +xu; } 2>/dev/null; [ -z \"$1\" ] && echo '<BREAKPOINT>' || echo \"<BREAKPOINT $@>\"; exit 214; }\n"))
 	// We are not using pipes here, see:
 	//  https://github.com/snapcore/spread/pull/64
 	// We also run it in a subshell, see
@@ -479,16 +515,10 @@ func (c *Client) runPart(script string, dir string, env *Environment, mode outpu
 	}
 
 	// Don't trace environment variables so secrets don't leak.
-	if mode == traceOutput || mode == perfOutput {
-		buf.WriteString("set -x\n")
-	}
-
 	if mode == shellOutput {
 		buf.WriteString("\n/bin/bash\n")
 	} else {
-		// Prevent any commands attempting to read from stdin to consume
-		// the shell script itself being sent to bash via its stdin.
-		fmt.Fprintf(&buf, "\n(\n%s\n) < /dev/null\n", script)
+		writeScriptRuntime(&buf, scripts, mode == traceOutput || mode == perfOutput)
 	}
 
 	errch := make(chan error, 2)
@@ -573,7 +603,13 @@ func (c *Client) runPart(script string, dir string, env *Environment, mode outpu
 		}
 	}
 
-	if e, ok := err.(*ssh.ExitError); ok && e.ExitStatus() == 213 {
+	if e, ok := err.(*ssh.ExitError); ok && e.ExitStatus() == breakpointExitStatus {
+		name, arg := lastControlCommand(stdout.Bytes())
+		if name == "BREAKPOINT" || name == "" {
+			return append(previous, stdout.Bytes()...), &breakpointError{msg: breakpointMessage(arg), output: stdout.Bytes()}
+		}
+	}
+	if e, ok := err.(*ssh.ExitError); ok && e.ExitStatus() == errorExitStatus {
 		lines := bytes.Split(bytes.TrimSpace(stdout.Bytes()), []byte{'\n'})
 		m := commandExp.FindSubmatch(lines[len(lines)-1])
 		if len(m) > 0 && string(m[1]) == "ERROR" {
@@ -878,11 +914,30 @@ func tail(output []byte) []byte {
 
 var commandExp = regexp.MustCompile("^<([A-Z_]+)(?: (.*))?>$")
 
+func lastControlCommand(output []byte) (name, arg string) {
+	lines := bytes.Split(bytes.TrimSpace(output), []byte{'\n'})
+	for i := len(lines) - 1; i >= 0; i-- {
+		m := commandExp.FindSubmatch(bytes.TrimSpace(lines[i]))
+		if len(m) > 0 {
+			return string(m[1]), string(m[2])
+		}
+	}
+	return "", ""
+}
+
+func breakpointMessage(arg string) string {
+	if arg == "" {
+		return "breakpoint"
+	}
+	return arg
+}
+
 // localScript holds and runs a local script in a polished manner.
 //
 // It's not used by the SSH client, but mimics the Client.runPart+runCommand closely.
 type localScript struct {
 	script      string
+	scripts     []StageScript
 	dir         string
 	env         *Environment
 	warnTimeout time.Duration
@@ -892,41 +947,44 @@ type localScript struct {
 	stop        <-chan struct{}
 }
 
+func (s *localScript) resolvedScripts() []StageScript {
+	if s.scripts != nil {
+		return s.scripts
+	}
+	return stageScripts("script", strings.TrimSpace(s.script))
+}
+
 func (s *localScript) run() (stdout, stderr []byte, err error) {
-	script := strings.TrimSpace(s.script)
-	if len(script) == 0 {
+	scripts := s.resolvedScripts()
+	if len(scripts) == 0 {
 		return nil, nil, nil
 	}
-	script += "\n"
 
 	var buf bytes.Buffer
 	buf.WriteString("set -eu\n")
+	buf.WriteString("set -E\n")
 	buf.WriteString("ADDRESS() { { set +xu; } 2> /dev/null; [ -z \"$1\" ] && echo '<ADDRESS>' || echo \"<ADDRESS $1>\"; }\n")
-	buf.WriteString("FATAL() { { set +xu; } 2> /dev/null; [ -z \"$1\" ] && echo '<FATAL>' || echo \"<FATAL $@>\"; exit 213; }\n")
-	buf.WriteString("ERROR() { { set +xu; } 2> /dev/null; [ -z \"$1\" ] && echo '<ERROR>' || echo \"<ERROR $@>\"; exit 213; }\n")
+	buf.WriteString("FATAL() { { set +xu; trap - ERR; } 2> /dev/null; [ -z \"$1\" ] && echo '<FATAL>' || echo \"<FATAL $@>\"; exit 213; }\n")
+	buf.WriteString("ERROR() { { set +xu; trap - ERR; } 2> /dev/null; [ -z \"$1\" ] && echo '<ERROR>' || echo \"<ERROR $@>\"; exit 213; }\n")
+	buf.WriteString("BREAKPOINT() { local pipestatus=\"${PIPESTATUS[*]}\"; { set +x; } 2>/dev/null; spread_stack_dump 214 \"BREAKPOINT${*:+ $*}\" \"${pipestatus:-214}\"; { trap - ERR; set +xu; } 2>/dev/null; [ -z \"$1\" ] && echo '<BREAKPOINT>' || echo \"<BREAKPOINT $@>\"; exit 214; }\n")
 	buf.WriteString("MATCH() { { set +xu; } 2> /dev/null; local stdin=$(cat); echo $stdin | grep -q -E \"$@\" || { echo \"error: pattern not found on stdin:\\n$stdin\">&2; return 1; }; }\n")
 	buf.WriteString("NOMATCH() { { set +xu; } 2> /dev/null; local stdin=$(cat); if echo $stdin | grep -q -E \"$@\"; then echo \"NOMATCH pattern='$@' found in:\n$stdin\">&2; return 1; fi }\n")
 	buf.WriteString("export DEBIAN_FRONTEND=noninteractive\n")
 	buf.WriteString("export DEBIAN_PRIORITY=critical\n")
 	buf.WriteString("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin\n")
 
-	for _, k := range s.env.Keys() {
-		v := s.env.Get(k)
-		if len(v) == 0 || v[0] == '"' || v[0] == '\'' {
-			fmt.Fprintf(&buf, "export %s=%s\n", k, v)
-		} else {
-			fmt.Fprintf(&buf, "export %s=\"%s\"\n", k, v)
+	if s.env != nil {
+		for _, k := range s.env.Keys() {
+			v := s.env.Get(k)
+			if len(v) == 0 || v[0] == '"' || v[0] == '\'' {
+				fmt.Fprintf(&buf, "export %s=%s\n", k, v)
+			} else {
+				fmt.Fprintf(&buf, "export %s=\"%s\"\n", k, v)
+			}
 		}
 	}
 
-	// Don't trace environment variables so secrets don't leak.
-	if s.mode == traceOutput {
-		fmt.Fprintf(&buf, "set -x\n")
-	}
-
-	// Prevent any commands attempting to read from stdin to consume
-	// the shell script itself being sent to bash via its stdin.
-	fmt.Fprintf(&buf, "\n(\n%s\n) < /dev/null\n", script)
+	writeScriptRuntime(&buf, scripts, s.mode == traceOutput)
 
 	debugf("Running local script:\n-----\n%s\n------", buf.Bytes())
 
@@ -1026,7 +1084,13 @@ Loop:
 		debugf("Error output from running script:\n-----\n%s\n-----", errbuf.Bytes())
 	}
 
-	if exitStatus(err) == 213 {
+	if exitStatus(err) == breakpointExitStatus {
+		name, arg := lastControlCommand(outbuf.Bytes())
+		if name == "BREAKPOINT" || name == "" {
+			return outbuf.Bytes(), nil, &breakpointError{msg: breakpointMessage(arg), output: outbuf.Bytes()}
+		}
+	}
+	if exitStatus(err) == errorExitStatus {
 		lines := bytes.Split(bytes.TrimSpace(outbuf.Bytes()), []byte{'\n'})
 		m := commandExp.FindSubmatch(lines[len(lines)-1])
 		if len(m) > 0 && string(m[1]) == "ERROR" {
@@ -1109,6 +1173,262 @@ func (sbuf *safeBuffer) Len() int {
 	sbuf.mu.Unlock()
 	return l
 }
+
+func scriptFileName(name string) string {
+	if name == "" {
+		name = "script"
+	}
+	var b strings.Builder
+	for _, r := range name {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '-' || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String() + ".sh"
+}
+
+func scriptHeredocDelim(scripts []StageScript) string {
+	delim := "SPREAD_SCRIPT_EOF"
+	for {
+		found := false
+		for _, script := range scripts {
+			if strings.Contains(script.Body, delim) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return delim
+		}
+		delim += "_X"
+	}
+}
+
+func writeScriptRuntime(buf *bytes.Buffer, scripts []StageScript, enableTrace bool) {
+	if len(scripts) == 0 {
+		return
+	}
+	delim := scriptHeredocDelim(scripts)
+	buf.WriteString(`SPREAD_SCRIPT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/spread-scripts.XXXXXX")
+trap 'rm -rf "$SPREAD_SCRIPT_DIR"' EXIT
+`)
+	for _, script := range scripts {
+		body := script.Body
+		if !strings.HasSuffix(body, "\n") {
+			body += "\n"
+		}
+		fmt.Fprintf(buf, "cat > \"$SPREAD_SCRIPT_DIR/%s\" <<'%s'\n%s%s\n", scriptFileName(script.Name), delim, body, delim)
+		if script.OriginFile != "" && script.OriginLine > 0 {
+			fmt.Fprintf(buf, "printf '%%s\\n%%d\\n' %s %d > \"$SPREAD_SCRIPT_DIR/%s.origin\"\n", bashSingleQuote(script.OriginFile), script.OriginLine, scriptFileName(script.Name))
+		}
+	}
+
+	buf.WriteString(spreadStackDumpFn)
+	buf.WriteString("shopt -s extdebug\n")
+	// Snapshot PIPESTATUS and $? in one assignment so the trap body does not clobber them.
+	buf.WriteString("trap 'pipestatus=\"${PIPESTATUS[*]}\" status=$?; { set +x; } 2>/dev/null; spread_stack_dump \"$status\" \"$BASH_COMMAND\" \"$pipestatus\"' ERR\n")
+	buf.WriteString(`: > "$SPREAD_SCRIPT_DIR/output"
+mkfifo "$SPREAD_SCRIPT_DIR/out.pipe"
+exec 3>&1
+tee -a "$SPREAD_SCRIPT_DIR/output" < "$SPREAD_SCRIPT_DIR/out.pipe" >&3 &
+SPREAD_TEE_PID=$!
+trap 'trap - ERR; exec 1>&3 2>&3; wait "$SPREAD_TEE_PID" 2>/dev/null; rm -rf "$SPREAD_SCRIPT_DIR"' EXIT
+exec > "$SPREAD_SCRIPT_DIR/out.pipe" 2>&1
+`)
+	if enableTrace {
+		// Parameter expansion only: command substitution in PS4 would recurse under set -x.
+		// BASH_SOURCE is unset in the wrapper (set -u), so expand it only when set.
+		buf.WriteString("declare -A SPREAD_YAML_FILE SPREAD_YAML_BASE\n")
+		for _, script := range scripts {
+			if script.OriginFile == "" || script.OriginLine <= 0 {
+				continue
+			}
+			fname := scriptFileName(script.Name)
+			fmt.Fprintf(buf, "SPREAD_YAML_FILE[\"$SPREAD_SCRIPT_DIR/%s\"]=%s\n", fname, bashSingleQuote(script.OriginFile))
+			fmt.Fprintf(buf, "SPREAD_YAML_BASE[\"$SPREAD_SCRIPT_DIR/%s\"]=%d\n", fname, script.OriginLine)
+		}
+		buf.WriteString("PS4='+ ${BASH_SOURCE[0]+${SPREAD_YAML_FILE[${BASH_SOURCE[0]}]:-${BASH_SOURCE[0]#$SPREAD_SCRIPT_DIR/}}:$((${SPREAD_YAML_BASE[${BASH_SOURCE[0]}]:-1}+LINENO-1))}: '\n")
+	}
+	buf.WriteString("{\n")
+	for _, script := range scripts {
+		if script.Path != "" {
+			fmt.Fprintf(buf, "export SPREAD_PHASE_PATH=\"%s\"\n", escapeBashDoubleQuote(script.Path))
+		}
+		if enableTrace {
+			// Delay set -x until the first command in the sourced file. The wrapper
+			// is `bash -` (no BASH_SOURCE), so tracing `source $SPREAD_SCRIPT_DIR/...`
+			// would print a bogus `+ :N: source /tmp/spread-scripts...` line.
+			fmt.Fprintf(buf, "( set -T; trap 'case \"${BASH_SOURCE[0]-}\" in \"$SPREAD_SCRIPT_DIR\"/*) trap - DEBUG; set +T; set -x;; esac' DEBUG; source \"$SPREAD_SCRIPT_DIR/%s\" )\n", scriptFileName(script.Name))
+		} else {
+			fmt.Fprintf(buf, "( source \"$SPREAD_SCRIPT_DIR/%s\" )\n", scriptFileName(script.Name))
+		}
+	}
+	buf.WriteString("} < /dev/null\n")
+}
+
+func escapeBashDoubleQuote(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, "`", "\\`")
+	s = strings.ReplaceAll(s, "$", "\\$")
+	return s
+}
+
+func bashSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, `'`, `'\''`) + "'"
+}
+
+const spreadStackDumpFn = `spread_stack_dump() {
+  local status=$1 cmd=$2 pipestatus=$3
+  if [ "$status" = 213 ]; then
+    return "$status"
+  fi
+  if [ -f "$SPREAD_SCRIPT_DIR/.stack-dumped" ]; then
+    return "$status"
+  fi
+  : > "$SPREAD_SCRIPT_DIR/.stack-dumped"
+  local -a _stack_argc _stack_argv
+  set +u
+  _stack_argc=("${BASH_ARGC[@]}")
+  _stack_argv=("${BASH_ARGV[@]}")
+  set -u
+  (
+    set +eu
+    stack_frame_file() {
+      local src=$1
+      local origin="${src}.origin"
+      if [ -r "$origin" ]; then
+        sed -n '1p' "$origin"
+        return
+      fi
+      case "$src" in
+        "$SPREAD_SCRIPT_DIR"/*) printf '%s' "${src##*/}" ;;
+        *) printf '%s' "$src" ;;
+      esac
+    }
+    stack_frame_lineno() {
+      local src=$1 lineno=$2
+      local origin="${src}.origin" base
+      if [ -r "$origin" ]; then
+        base=$(sed -n '2p' "$origin")
+        if [ -n "$base" ] && [ "$lineno" -gt 0 ] 2>/dev/null; then
+          echo $((base + lineno - 1))
+          return
+        fi
+      fi
+      printf '%s' "$lineno"
+    }
+    stack_frame_line() {
+      local src=$1 lineno=$2
+      local origin="${src}.origin" yamlfile yamlline
+      if [ -r "$origin" ]; then
+        yamlfile=$(sed -n '1p' "$origin")
+        yamlline=$(stack_frame_lineno "$src" "$lineno")
+        if [ -n "$yamlfile" ] && [ -n "${SPREAD_PATH-}" ] && [ -r "$SPREAD_PATH/$yamlfile" ]; then
+          sed -n "${yamlline}{p;q}" "$SPREAD_PATH/$yamlfile" 2>/dev/null
+          return
+        fi
+      fi
+      if [ -n "$lineno" ] && [ "$lineno" -gt 0 ] 2>/dev/null && [ -r "$src" ]; then
+        sed -n "${lineno}{p;q}" "$src" 2>/dev/null
+      fi
+    }
+    stack_frame_args() {
+      local idx=$1
+      local offset=0 k j argc arg n maxn=16 maxc=200 out
+      for ((k=0; k<idx; k++)); do
+        offset=$((offset + ${_stack_argc[k]:-0}))
+      done
+      argc=${_stack_argc[idx]:-0}
+      [ "$argc" -gt 0 ] 2>/dev/null || return 0
+      n=0
+      out=""
+      for ((j=argc-1; j>=0; j--)); do
+        arg="${_stack_argv[offset+j]}"
+        if [ "${#arg}" -gt "$maxc" ]; then
+          arg="${arg:0:$maxc}..."
+        fi
+        arg=$(printf '%q' "$arg")
+        if [ -n "$out" ]; then
+          out="$out $arg"
+        else
+          out="$arg"
+        fi
+        n=$((n+1))
+        if [ "$n" -ge "$maxn" ]; then
+          if [ "$argc" -gt "$maxn" ]; then
+            out="$out ..."
+          fi
+          break
+        fi
+      done
+      printf '%s' "$out"
+    }
+    local src="${BASH_SOURCE[1]}"
+    local fail_lineno="${BASH_LINENO[0]}"
+    local file line frames i func disp lineno text n recent args fail_disp nlines
+    file=$(stack_frame_file "$src")
+    fail_disp=$(stack_frame_lineno "$src" "$fail_lineno")
+    line=$(stack_frame_line "$src" "$fail_lineno")
+    frames=""
+    for ((i=${#BASH_SOURCE[@]}-1; i>=1; i--)); do
+      src="${BASH_SOURCE[i]}"
+      lineno="${BASH_LINENO[i-1]}"
+      func="${FUNCNAME[i]:-MAIN}"
+      case "$src" in
+        ""|"-"|/dev/fd/*) continue ;;
+      esac
+      disp=$(stack_frame_file "$src")
+      args=""
+      if [ "$func" != source ] && [ "$func" != main ] && [ "$func" != MAIN ]; then
+        args=$(stack_frame_args "$i")
+      fi
+      frames="${frames}  File: \"${disp}\", lineno: $(stack_frame_lineno "$src" "$lineno"), in ${func}"$'\n'
+      text=$(stack_frame_line "$src" "$lineno")
+      if [ -n "$text" ]; then
+        frames="${frames}    ${text}"$'\n'
+      fi
+      if [ -n "$args" ]; then
+        frames="${frames}    args: ${args}"$'\n'
+      fi
+    done
+    n=${SPREAD_STACK_OUTPUT:-20}
+    case "$n" in
+      ''|*[!0-9]*) n=20 ;;
+    esac
+    if [ "$n" -gt 0 ] && [ -f "$SPREAD_SCRIPT_DIR/output" ]; then
+      recent=$(tail -n "$n" "$SPREAD_SCRIPT_DIR/output" 2>/dev/null)
+    fi
+    echo "----- spread stack -----" >&2
+    echo "job: ${SPREAD_JOB:-}" >&2
+    echo "path: ${SPREAD_PHASE_PATH:-}" >&2
+    echo "phase: ${SPREAD_OPERATION:-unknown}" >&2
+    if [ "$status" = 214 ]; then
+      echo "kind: breakpoint" >&2
+    fi
+    echo "file: ${file:-}" >&2
+    echo "lineno: ${fail_disp:-}" >&2
+    echo "line: ${line}" >&2
+    echo "cmd: ${cmd}" >&2
+    echo "exit code: ${status}" >&2
+    echo "pipestatus: ${pipestatus}" >&2
+    echo >&2
+    if [ -n "$frames" ]; then
+      echo "Traceback (most recent call last):" >&2
+      printf '%s' "$frames" >&2
+    fi
+    if [ -n "$recent" ]; then
+      nlines=$(printf '%s' "$recent" | awk 'END {print NR}')
+      echo >&2
+      echo "last output (${nlines} lines):" >&2
+      printf '%s\n' "$recent" | sed 's/^/  /' >&2
+    fi
+  )
+  return "$status"
+}
+`
 
 func outputErr(output []byte, err error) error {
 	output = bytes.TrimSpace(output)

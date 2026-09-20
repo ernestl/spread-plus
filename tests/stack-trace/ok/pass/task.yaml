@@ -1,0 +1,4 @@
+summary: Success path has no stack dump
+
+execute: |
+    echo WORKS

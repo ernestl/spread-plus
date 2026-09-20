@@ -1,0 +1,69 @@
+summary: Test bash stack traces through LXD.
+
+prepare: |
+    if [ ! -f .spread-reuse.yaml ]; then
+        touch /run/spread-reuse.yaml
+        ln -s /run/spread-reuse.yaml .spread-reuse.yaml
+    fi
+
+restore: |
+    rm -f pass.out nested.out error.out breakpoint.out
+
+execute: |
+    spread -vv -reuse -resend lxd:ok/ &> pass.out
+    grep 'lxd:ubuntu-22.04:ok/pass' pass.out
+    grep 'lxd:ubuntu-22.04-b:ok/pass' pass.out
+    test "$(grep -c '^WORKS$' pass.out)" -ge 2
+    ! grep 'spread stack' pass.out
+
+    spread -vv -reuse -resend lxd:fail/nested &> nested.out || true
+    grep 'lxd:ubuntu-22.04:fail/nested' nested.out
+    grep 'lxd:ubuntu-22.04-b:fail/nested' nested.out
+    test "$(grep -c '----- spread stack -----' nested.out)" -ge 2
+    grep 'job: lxd:ubuntu-22.04:fail/nested' nested.out
+    grep 'job: lxd:ubuntu-22.04-b:fail/nested' nested.out
+    grep 'path: .*fail/nested-execute' nested.out
+    grep 'phase: executing' nested.out
+    grep 'file: lib/c.sh' nested.out
+    grep 'lineno:' nested.out
+    grep 'line:.*false' nested.out
+    grep 'cmd: false' nested.out
+    grep 'exit code: 1' nested.out
+    grep 'pipestatus: 1' nested.out
+    grep 'Traceback (most recent call last):' nested.out
+    grep 'File: "fail/nested/task.yaml"' nested.out
+    grep 'File: "fail/nested/task.yaml", lineno: 5, in source' nested.out
+    grep 'File: "lib/a.sh"' nested.out
+    grep 'File: "lib/b.sh"' nested.out
+    grep 'File: "lib/c.sh"' nested.out
+    grep 'args: snap core' nested.out
+    grep 'fail/nested/task.yaml:4: source lib/a.sh' nested.out
+    grep 'lib/c.sh:.*false' nested.out
+    ! grep 'File: "task.execute.sh"' nested.out
+    ! grep 'task.execute.sh:' nested.out
+    ! grep 'File: "suite.prepare-each' nested.out
+
+    spread -vv -reuse -resend lxd:fail/error &> error.out || true
+    grep 'lxd:ubuntu-22.04:fail/error' error.out
+    grep 'lxd:ubuntu-22.04-b:fail/error' error.out
+    grep 'boom' error.out
+    ! grep 'spread stack' error.out
+
+    spread -vv -reuse -resend lxd:fail/breakpoint &> breakpoint.out || true
+    grep 'lxd:ubuntu-22.04:fail/breakpoint' breakpoint.out
+    grep 'lxd:ubuntu-22.04-b:fail/breakpoint' breakpoint.out
+    grep '----- spread stack -----' breakpoint.out
+    grep 'kind: breakpoint' breakpoint.out
+    grep 'exit code: 214' breakpoint.out
+    grep 'Breakpoint executing' breakpoint.out
+    grep 'Breakpoint tasks' breakpoint.out
+    ! grep 'Failed tasks' breakpoint.out
+
+debug: |
+    cat pass.out || true
+    echo
+    cat nested.out || true
+    echo
+    cat error.out || true
+    echo
+    cat breakpoint.out || true

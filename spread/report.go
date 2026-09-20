@@ -32,6 +32,7 @@ type Item struct {
 type Results struct {
 	TaskPassed           int `json:"task-passed,attr"`
 	TaskFailed           int `json:"task-failed,attr"`
+	TaskBreakpoint       int `json:"task-breakpoint,attr"`
 	TaskAborted          int `json:"task-aborted,attr"`
 	TaskSkipped          int `json:"task-skipped,attr"`
 	TaskPrepareFailed    int `json:"task-prepare-failed,attr"`
@@ -139,9 +140,10 @@ func (r *Report) addAbortedTask(backend string, system string, task string, vari
 	return item
 }
 
-func (r *Report) addTaskResults(passed int, failed int, aborted int, skipped int, prepareFailed int, restoreFailed int) {
+func (r *Report) addTaskResults(passed int, failed int, aborted int, skipped int, prepareFailed int, restoreFailed int, breakpoint int) {
 	r.ExecutionResults.TaskPassed = passed
 	r.ExecutionResults.TaskFailed = failed
+	r.ExecutionResults.TaskBreakpoint = breakpoint
 	r.ExecutionResults.TaskAborted = aborted
 	r.ExecutionResults.TaskSkipped = skipped
 	r.ExecutionResults.TaskPrepareFailed = prepareFailed

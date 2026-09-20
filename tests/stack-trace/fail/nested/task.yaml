@@ -1,0 +1,5 @@
+summary: Nested source failure dumps bash frames
+
+execute: |
+    source lib/a.sh
+    a_call snap core

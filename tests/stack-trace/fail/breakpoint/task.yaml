@@ -1,0 +1,4 @@
+summary: BREAKPOINT dumps a stack and is recorded as a breakpoint
+
+execute: |
+    BREAKPOINT "stop here"
